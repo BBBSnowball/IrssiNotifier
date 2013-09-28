@@ -40,6 +40,9 @@
 import weechat, string, os, urllib, urllib2, shlex
 from subprocess import Popen, PIPE
 
+# This should be the same as in irssinotifier.pl, so the website doesn't tell the user to update her script.
+VERSION = 18
+
 weechat.register("irssinotifier", "Caspar Clemens Mierau <ccm@screenage.de>", "0.5", "GPL3", "irssinotifier: Send push notifications to Android's IrssiNotifier about your private message and highligts.", "", "")
 
 settings = {
@@ -89,8 +92,18 @@ def show_notification(chan, nick, message):
     API_TOKEN = weechat.config_get_plugin("api_token")
     if API_TOKEN != "":
         url = "https://irssinotifier.appspot.com/API/Message"
-        postdata = urllib.urlencode({'apiToken':API_TOKEN,'nick':encrypt(nick),'channel':encrypt(chan),'message':encrypt(message),'version':13})
+        postdata = urllib.urlencode({'apiToken':API_TOKEN,'nick':encrypt(nick),'channel':encrypt(chan),'message':encrypt(message),'version':VERSION})
         version = weechat.info_get("version_number", "") or 0
-        hook1 = weechat.hook_process_hashtable("url:"+url, { "postfields":  postdata}, 2000, "", "")
+        #TODO irssinotifier.pl retries 2 times and I think we should also retry (unless we know that the error is permanent)
+        hook1 = weechat.hook_process_hashtable("url:"+url, { "postfields":  postdata}, 10000, "", "")
+
+# not used, yet
+def send_command(command):
+    API_TOKEN = weechat.config_get_plugin("api_token")
+    if API_TOKEN != "":
+        url = "https://irssinotifier.appspot.com/API/Message"
+        postdata = urllib.urlencode({'apiToken':API_TOKEN,'command':encrypt(command)})
+        #TODO irssinotifier.pl retries 2 times and I think we should also retry (unless we know that the error is permanent)
+        hook1 = weechat.hook_process_hashtable("url:"+url, { "postfields":  postdata}, 10000, "", "")
 
 # vim: autoindent expandtab smarttab shiftwidth=4
