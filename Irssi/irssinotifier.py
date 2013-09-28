@@ -69,8 +69,9 @@ def notify_show(data, bufferp, uber_empty, tagsn, isdisplayed,
     mynick = weechat.buffer_get_string(bufferp,"localvar_nick")
 
     # only notify if the message was not sent by myself
-    if (weechat.buffer_get_string(bufferp, "localvar_type") == "private") and (prefix!=mynick):
-            show_notification(prefix, prefix, message)
+    if weechat.buffer_get_string(bufferp, "localvar_type") == "private":
+        if prefix != mynick:
+            show_notification("!PRIVATE", prefix, message)
 
     elif ishilight == "1":
         buffer = (weechat.buffer_get_string(bufferp, "short_name") or
