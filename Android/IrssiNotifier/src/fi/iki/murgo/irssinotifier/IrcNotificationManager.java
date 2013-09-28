@@ -196,18 +196,27 @@ public class IrcNotificationManager {
         if (true) {
 			// see http://developer.getpebble.com/1/03_API_Reference/03_Android/#notifications
 		    final Intent intent = new Intent("com.getpebble.action.SEND_NOTIFICATION");
+		    
+		    String title, text;
+            if (msg.isPrivate()) {
+                title = msg.getNick();
+                text = msg.getMessage();
+            } else {
+                title = msg.getChannel();
+                if (msg.getChannel() != msg.getNick())
+                	text = "(" + msg.getNick() + ") " + msg.getMessage();
+                else
+                	text = msg.getMessage();
+            }
 	
 		    final Map<String, Object> data = new HashMap<String, Object>();
-		    String title = titleText;
-		    if (currentUnreadCount > 1)
-		    	title += " (" + (currentUnreadCount - 1) + " more)";
 		    data.put("title", title);
-		    data.put("body", notificationMessage);
+		    data.put("body", text);
 		    final JSONObject jsonData = new JSONObject(data);
 		    final String notificationData = new JSONArray().put(jsonData).toString();
 	
 		    intent.putExtra("messageType", "PEBBLE_ALERT");
-		    intent.putExtra("sender", "WeeChat");
+		    intent.putExtra("sender", "IrssiNotifier");
 		    intent.putExtra("notificationData", notificationData);
 
 		    context.sendBroadcast(intent);
