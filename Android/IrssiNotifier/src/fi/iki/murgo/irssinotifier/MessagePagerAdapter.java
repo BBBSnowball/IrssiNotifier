@@ -3,6 +3,8 @@ package fi.iki.murgo.irssinotifier;
 
 import java.util.List;
 
+import fi.iki.murgo.irssinotifier.plus.R;
+
 import android.os.Parcelable;
 import android.support.v4.view.PagerAdapter;
 import android.text.SpannableString;

@@ -4,6 +4,8 @@ package fi.iki.murgo.irssinotifier;
 import java.util.ArrayList;
 import java.util.List;
 
+import fi.iki.murgo.irssinotifier.plus.R;
+
 import android.app.Activity;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager.NameNotFoundException;

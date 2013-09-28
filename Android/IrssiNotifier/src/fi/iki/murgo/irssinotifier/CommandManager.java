@@ -1,5 +1,6 @@
 package fi.iki.murgo.irssinotifier;
 
+import fi.iki.murgo.irssinotifier.plus.R;
 import android.util.Log;
 
 import android.app.Notification;

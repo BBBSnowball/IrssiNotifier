@@ -18,6 +18,8 @@ import android.preference.PreferenceActivity;
 import android.support.v4.app.NotificationCompat;
 import android.util.Log;
 import org.apache.http.auth.AuthenticationException;
+
+import fi.iki.murgo.irssinotifier.plus.R;
 import yuku.ambilwarna.AmbilWarnaDialog;
 
 import java.io.IOException;

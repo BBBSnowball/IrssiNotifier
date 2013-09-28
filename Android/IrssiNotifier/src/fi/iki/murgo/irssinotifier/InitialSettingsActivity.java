@@ -17,6 +17,8 @@ import android.widget.ListView;
 import android.widget.TextView;
 import org.apache.http.auth.AuthenticationException;
 
+import fi.iki.murgo.irssinotifier.plus.R;
+
 import java.io.IOException;
 
 public class InitialSettingsActivity extends Activity {

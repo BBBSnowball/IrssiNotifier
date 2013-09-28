@@ -6,6 +6,8 @@ import java.util.List;
 
 import com.mobeta.android.dslv.DragSortListView;
 
+import fi.iki.murgo.irssinotifier.plus.R;
+
 import android.app.AlertDialog;
 import android.app.ListActivity;
 import android.content.Context;
