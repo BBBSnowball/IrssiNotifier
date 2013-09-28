@@ -52,6 +52,9 @@ for option, default_value in settings.items():
         weechat.prnt("", weechat.prefix("error") + "irssinotifier: Please set option: %s" % option)
         weechat.prnt("", "irssinotifier: /set plugins.var.python.irssinotifier.%s STRING" % option)
 
+        # create setting with default value, so the user can use autocompletion
+        weechat.config_set_plugin(option, default_value)
+
 # Hook privmsg/hilights
 weechat.hook_print("", "irc_privmsg", "", 1, "notify_show", "")
 
