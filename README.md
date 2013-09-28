@@ -1,5 +1,9 @@
 #IrssiNotifier
 
+**This is a fork with Pebble support. If you don't need that, you should use
+[the original project](https://github.com/murgo/IrssiNotifier) which will likely
+be more up-to-date.**
+
 Get notifications from IRC hilights and private messages from Irssi to Android.
 
 Check it out on [Google Play](https://play.google.com/store/apps/details?id=fi.iki.murgo.irssinotifier)!
