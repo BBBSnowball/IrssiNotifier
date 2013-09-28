@@ -243,8 +243,11 @@ public class IrcNotificationManager {
                         title = "Query from " + msg.getNick();
                         text = msg.getMessage();
                     } else {
-                        title = "Hilight at " + msg.getChannel();
-                        text = "(" + msg.getNick() + ") " + msg.getMessage();
+                        title = "HL at " + msg.getChannel();
+                        if (msg.getChannel() != msg.getNick())
+                        	text = "(" + msg.getNick() + ") " + msg.getMessage();
+                        else
+                        	text = msg.getMessage();
                     }
                 } else {
                     if (msg.isPrivate()) {
@@ -282,8 +285,11 @@ public class IrcNotificationManager {
                     title = "Query from " + msg.getNick();
                     text = msg.getMessage();
                 } else {
-                    title = "Hilight at " + msg.getChannel();
-                    text = "(" + msg.getNick() + ") " + msg.getMessage();
+                    title = "HL at " + msg.getChannel();
+                    if (msg.getChannel() != msg.getNick())
+                    	text = "(" + msg.getNick() + ") " + msg.getMessage();
+                    else
+                    	text = msg.getMessage();
                 }
                 break;
 
@@ -301,8 +307,11 @@ public class IrcNotificationManager {
                     }
                 } else {
                     if (channelUnreadCount <= 1) {
-                        title = "Hilight at " + msg.getChannel();
-                        text = "(" + msg.getNick() + ") " + msg.getMessage();
+                        title = "HL at " + msg.getChannel();
+                        if (msg.getChannel() != msg.getNick())
+                        	text = "(" + msg.getNick() + ") " + msg.getMessage();
+                        else
+                        	text = msg.getMessage();
                     } else {
                         title = "" + channelUnreadCount + " new hilights at " + msg.getChannel();
                         text = "Last: (" + msg.getNick() + ") " + msg.getMessage();
