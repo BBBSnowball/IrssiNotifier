@@ -55,8 +55,10 @@ SCRIPT_VERSION = "0.1"
 SCRIPT_LICENSE = "GPL"
 SCRIPT_DESC    = "Send notifications"
 
+DEBUG = True
 
-import sys, random, time, logging
+
+import sys, random, time, logging, inspect, re
 
 try:
     import weechat
@@ -76,7 +78,8 @@ except:
 # -> print to WeeChat main buffer
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+if DEBUG:
+    logger.setLevel(logging.DEBUG)
 
 if in_weechat:
     # log to weechat root buffer and don't propagate to default handler
@@ -87,6 +90,8 @@ if in_weechat:
             text = self.format(record)
             weechat.prnt("", text)
     logger.addHandler(WeeChatLogger())
+else:
+    logging.basicConfig()
 
 
 ### Base classes for notifications, sources, sinks, ...
@@ -207,6 +212,9 @@ class TagSet(set):
     __str__ = __repr__
 
 class DeliveryStatus(object):
+    #NOTE I might make that a proper enum, so you shouldn't rely on the values being ints. However, you
+    #     will always be able to cast them to a number with int() and compare them to numbers and each
+    #     other (<, >, >=, <=, ==, !=).
     # user has confirmed that he has seen the notification
     confirmed = 100
     # notification was presented on a device that the user was using at that time
@@ -293,9 +301,14 @@ class NotificationFilter(object):
             return super(NotificationFilter, self).getattr(attr, *args)
 
 
-### WeeChat-specific subclasses
+### Helper classes
 
 class ObjectRegistry(object):
+    """Assign ids to objects and allow them to be retrieved by id.
+
+    We can pass some data to hooks, but it cannot be a Python object. Therefore, we pass the
+    id and later retrieve the object from the registry."""
+
     _instances = {}
 
     @classmethod
@@ -313,6 +326,209 @@ class ObjectRegistry(object):
     @classmethod
     def get(cls, id):
         return cls._instances[int(id)]
+
+class ShortNameRegistry(type):
+    """
+    Metaclass. Assigns short names to classes, used for evaluating user code.
+
+    Use add_category(baseclass) to add a category. Subclasses of baseclass can be registered in that
+    category. baseclass should use `__metaclass__ = ShortNameRegistry`, so subclasses are automatically
+    registered, if they have "__shortname__" in their class dict.
+
+    In the subclass, you can set a short name like this: __shortname__ = "name"
+    If auto-detection fails, set the category, as well:  __category__  = CategoryClass
+
+    Shortnames will be made available via the locals argument to eval. If you don't set a shortname, the
+    class won't be available as a local name, but the long name is available because it will be in the
+    global dictionary. If you don't want that, you can simply declare the class in another namespace.
+    """
+
+    _registry   = { }
+    _used_names = { }
+
+    @staticmethod
+    def _key(baseclass):
+        if not isinstance(baseclass, type):
+            raise TypeError("Category must be a type name (the common base class for the category), but it is %s (%s)"
+                % (baseclass, type(baseclass)))
+        # We use the class name because I don't know whether a class can (efficiently) be used as a hash key.
+        return baseclass.__name__
+
+    @classmethod
+    def add_category(cls, baseclass):
+        baseclass_key = cls._key(baseclass)
+        if baseclass_key in cls._registry:
+            raise ValueError("'%s' is already registered as a category in ShortNameRegistry" % baseclass)
+        
+        cls._registry[baseclass_key] = { }
+
+    @classmethod
+    def _find_category_of_class(cls, class_to_register):
+        baseclasses = filter(lambda bcls: cls._key(bcls) in cls._registry, inspect.getmro(class_to_register))
+        if len(baseclasses) > 0:
+            return baseclasses[0]
+        else:
+            logger.info("Couldn't determine category that I should register %s for." % class_to_register)
+            logger.info("  mro:        " + str(inspect.getmro(class_to_register)))
+            logger.info("  mro (keys): " + str(map(lambda bcls: cls._key(bcls), inspect.getmro(class_to_register))))
+            logger.info("  categories: " + str(cls._registry.keys()))
+            raise TypeError("Couldn't determine category that I should register %s for." % class_to_register)
+
+    @classmethod
+    def register(cls, name, class_to_register, baseclass = None):
+        # look at parents of class_to_register to find the category class
+        if not baseclass:
+            baseclass = cls._find_category_of_class(class_to_register)
+        baseclass_key = cls._key(baseclass)
+
+        # make sure we cannot use a name twice
+        #NOTE As categories can be combined at will, none may share a name.
+        if name in cls._used_names:
+            raise ValueError("The name '%s' is already used for a %s." % (name, cls._used_names[name]))
+
+        # register the class
+        #NOTE This will throw an exception (KeyError), if the category doesn't exist. This is intended.
+        cls._registry[baseclass_key][name] = class_to_register
+        cls._used_names[name] = type
+
+        # return registered class, so this can be used as a class decorator
+        return class_to_register
+
+    @classmethod
+    def has(cls, baseclass, name = None):
+        key = cls._key(baseclass)
+        return key in cls._registry and (name is None or name in cls._registry[key])
+
+    @classmethod
+    def get(cls, baseclass, name):
+        key = cls._key(baseclass)
+        #NOTE This will throw an exception (KeyError), if either baseclass or name doesn't exist. This is intended.
+        return cls._registry[key][name]
+
+    @classmethod
+    def make_local_scope(cls, *categories):
+        # special case: no arguments at all means all categories
+        if len(categories) == 0:
+            categories = cls._registry.keys()
+
+        # a scope is just a dict, so we simply copy our registry dicts into it
+        scope = dict()
+        for category in categories:
+            if isinstance(category, str):
+                #NOTE The user shouldn't pass a string. This is for ourselves, when categories is empty (see above).
+                #     We won't stop the user from passing a string, but don't expect that to work forever.
+                key = category
+            else:
+                key = cls._key(category)
+            #NOTE This will throw an exception (KeyError), if the category doesn't exist. This is intended.
+            scope.update(cls._registry[key])
+        return scope
+
+    @classmethod
+    def eval(cls, expr, *categories):
+        # build scope with shortnames in categories
+        scope = cls.make_local_scope(*categories)
+
+        # try to guess whether it is an expression or some statements
+        # -> if it ends with a return statement, we assume it consists of statements
+        m = re.search("return\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*;?\s*$", expr)
+        if m:
+            # remove return statement because it isn't valid outside of a function
+            expr = expr[0:m.start()]
+
+            # it is a statement -> use exec
+            exec(expr, globals(), scope)
+
+            # exec doesn't return anything, but the return statement tells us what value we should grab
+            result_var = m.group(1)
+            if result_var in scope:
+                return scope[result_var]
+            else:
+                raise ValueError(("I evaluated your code and expected to find the variable '%s' according to "
+                    + "your return statement. Unfortunately, it doesn't exist. This is your code: \"\"\"%s\"\"\" "
+                    + "and '%s'")
+                    % (result_var, expr, m.group(0)))
+        else:
+            # it is an expression -> use eval
+            return eval(expr, globals(), scope)
+
+    # This class can be used as a metaclass that automatically registers classes and their subclasses.
+    #NOTE If any subclass uses another metaclass, this won't work for that class (and its subclasses).
+    def __new__(mcs, name, bases, dict):
+        # create the class
+        cls = type.__new__(mcs, name, bases, dict)
+
+        # register it, if it has a __shortname__ property
+        if "__shortname__" in dict:
+            if "__category__" in dict:
+                baseclass = dict["__category__"]
+            else:
+                baseclass = cls._find_category_of_class(cls)
+
+            mcs.register(dict["__shortname__"], cls, baseclass)
+
+        # return the class
+        return cls
+
+def register_shortname(name, category = None):
+    return lambda cls: ShortNameRegistry.register(name, cls, category)
+
+class WithShortname(object):
+    __metaclass__ = ShortNameRegistry
+
+#### Classes for test of ShortNameRegistry
+
+def register_classes_for_shortname_test():
+    class Base1(WithShortname):
+        pass
+    class Base2(object):
+        pass
+
+    ShortNameRegistry.add_category(Base1)
+    ShortNameRegistry.add_category(Base2)
+
+    # simple decorator, category is auto-detected
+    @register_shortname("a2")
+    class A2(Base2):
+        pass
+    # auto-detection fails, so we specify the category as an argument
+    @register_shortname("b1", Base1)
+    class B1(object):
+        pass
+    # overwrite auto-detected category
+    @register_shortname("c1", Base1)
+    class C1(Base2):
+        pass
+    # register via metaclass, category auto-detected
+    class D1(Base1):
+        __shortname__ = "d1"
+    # auto-detection fails, so we specify the category as an argument
+    class E2(object):
+        # super doesn't set the metaclass, so we do that here
+        __metaclass__ = ShortNameRegistry
+        __shortname__ = "e2"
+        __category__  = Base2
+    # overwrite auto-detected category
+    class F2(Base1):
+        __shortname__ = "f2"
+        __category__  = Base2
+    # use metaclass, but don't give a shortname -> not registered
+    class G0(Base1):
+        pass
+
+    return { "categories": [Base1, Base2], Base1: {"b1": B1, "c1": C1, "d1": D1},
+                Base2: {"a2": A2, "e2": E2, "f2": F2}, None: {"g0": G0},
+                "tests": [ ["a2()", [Base2], A2], ["(c1(), d1())[1]", [], D1], ["c1", [Base2], NameError],
+                           ["(a2(), c1())[1]", [], C1], ["(a2(), c1())[1]", [Base1, Base2], C1],
+                           ["(a2(), c1())[1]", [Base1], NameError],
+                           # a few statements
+                           ["a = a2();    c = c1(); return a",       [], A2],
+                           ["a = a2();    c = c1(); return c ; ",    [], C1],
+                           ["a = a2(); _c_1 = c1(); return _c_1 ; ", [], C1],
+                           ["a = a2();    c = c1(); return b",       [], ValueError]] }
+
+
+### WeeChat-specific subclasses
 
 def _on_notification(id, *args):
     self = ObjectRegistry.get(id)
@@ -382,7 +598,7 @@ class WeeChatNotificationSource(NotificationSource):
         return weechat.WEECHAT_RC_OK
 
 
-### container subclasses
+### Container subclasses
 
 class MultiNotificationSink(NotificationSink):
     """Combine several sinks and send notifications to each of them"""
@@ -496,7 +712,7 @@ class OperatorNotificationFilter(NotificationFilter):
             return TagSet("*")
 
 
-### helper filters
+### Helper filters
 
 class DecoratorNotificationFilter(NotificationFilter):
     """Abstract class. Modify the behaviour of an inner filter."""
@@ -526,50 +742,11 @@ class ScaleNotificationFilter(DecoratorNotificationFilter):
         return super(ScaleNotificationFilter, self).prioritize(notification) * self._factor
 
 
-### some filters
-
-class RegisteredNotificationFilter(NotificationFilter):
-    """Abstract class. This filter has a short name that the user can use when building filters"""
-
-    _registry = {}
-
-    @classmethod
-    def register(cls, name, filter):
-        if name in cls._registry:
-            raise ValueError("The name '%s' is already used for another NotificationFilter.")
-        cls._registry[name] = filter
-        # return filter class, so this can be used as a class decorator
-        return filter
-
-    @classmethod
-    def has(cls, name):
-        return name in cls._registry
-
-    @classmethod
-    def get(cls, name):
-        return cls._registry[name]
-
-    @classmethod
-    def make_local_scope(cls):
-        # a scope is just a dict, so we simply copy our registry
-        return cls._registry.copy()
-
-    @classmethod
-    def eval_filter(cls, expr):
-        return eval(expr, globals(), cls.make_local_scope())
-
-def register(name):
-    return lambda cls: RegisteredNotificationFilter.register(name, cls)
-
-@register("blub")
-class BlubNotificationFilter(RegisteredNotificationFilter):
-    pass
+### Some filters
 
 
-del register
 
-
-### other stuff
+### Other stuff
 
 class RemoteNotifySink(NotificationSink):
     def __init__(self, inner):
@@ -668,13 +845,36 @@ if have_unittest:
             # not testing __sub__ because it behaves like set.__sub__
             # Yeah, I wouldn't have to test union() for the same reason...
 
-        def testRegisteredNotificationFilter(self):
-            self.assertTrue(RegisteredNotificationFilter.has("blub"))
-            self.assertTrue(not RegisteredNotificationFilter.has("unobtainium"))
+        def testShortNameRegistry(self):
+            # we need some test classes
+            t = register_classes_for_shortname_test()
 
-            self.assertIs(RegisteredNotificationFilter.get("blub"), BlubNotificationFilter)
+            for category in t["categories"]:
+                self.assertTrue(ShortNameRegistry.has(category))
+            self.assertFalse(ShortNameRegistry.has(TestNotifications))
+            self.assertRaises(KeyError, lambda: ShortNameRegistry.get(TestNotifications, "dummy"))
 
-            self.assertIsInstance(RegisteredNotificationFilter.eval_filter("blub()"), BlubNotificationFilter)
+            for category, members in t.iteritems():
+                # is it a category or None? (not "categories")
+                if isinstance(category, type) or category is None:
+                    for name, cls in members.iteritems():
+                        # we can retrieve all registered classes
+                        if category is not None:
+                            self.assertTrue(ShortNameRegistry.has(category, name),
+                                "'%s' exists in category %s" % (name, category))
+                            self.assertIs  (ShortNameRegistry.get(category, name), cls)
+
+                        # we cannot retrieve them from another category
+                        for category2 in t.keys():
+                            if isinstance(category2, type) and category != category2:
+                                self.assertFalse(ShortNameRegistry.has(category2, name))
+                                self.assertRaises(KeyError, lambda: ShortNameRegistry.get(category2, name))
+
+            for code_to_eval, categories, should_be_instance_of in t["tests"]:
+                if not issubclass(should_be_instance_of, Exception):
+                    self.assertIsInstance(ShortNameRegistry.eval(code_to_eval, *categories), should_be_instance_of)
+                else:
+                    self.assertRaises(should_be_instance_of, lambda: ShortNameRegistry.eval(code_to_eval, *categories))
 
 if __name__ == "__main__":
     if in_weechat:
