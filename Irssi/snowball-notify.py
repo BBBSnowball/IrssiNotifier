@@ -255,7 +255,13 @@ class NotificationPriority(object):
     __slots__ = "_priority"
 
     def __init__(self, priority):
-        self._priority = priority
+        if isinstance(priority, bool):
+            if priority:
+                self._priority = 1
+            else:
+                self._priority = -1
+        else:
+            self._priority = priority
 
     def __int__(self):
         return self._priority
@@ -475,6 +481,215 @@ def register_shortname(name, category = None):
 
 class WithShortname(object):
     __metaclass__ = ShortNameRegistry
+
+class PatternMatcher(object):
+    """Test whether a string matches a pattern which can either use shell syntax or a regex
+
+    You have several options:
+    (NOTE: uppercase variants might match as well, see below)
+    - normal string, e.g. "abc" (special case of shell patterns)
+      -> matches "abc"
+    - normal string with special chars, e.g. "exact:a*b*c"
+      -> matches "a*b*c"
+    - shell patterns, e.g. "abc*"
+      -> matches any string that starts with "abc"
+    - regex, e.g. "^ab*c$"
+      -> matches "ac", "abc", "abbc", ...
+
+    The context (i.e. whoever creates the PatternMatcher) can tell it to do case-insensitive
+    matching. If the context doesn't say anything, the default is case-insensitive matching.
+    You can use one of the prefixes "case-sensitive:"/"cs:" or "ignore-case:"/"ic:" to force
+    a particular mode. If you use it together with another prefix, the case prefix must be
+    the first one, e.g. "ic:re:^ab*c$"
+
+    Shell patterns support these special chars:
+      '*'       zero or more arbitrary characters
+      '?'       exactly one arbitrary character
+      '[a-z_]'  character range and/or enumeration (in this example: lowercase letters and underscore)
+      '{ab,cd}' either 'ab' or 'cd', supports nesting
+      '\\'      escape following character (i.e. use its literal meaning);
+                '\n' and some others are treated as in strings
+    Shell patterns are translated to regular expressions. This means that some characters might accidentally
+    have the same special meaning as in a regex. If you trip over such a bug, please report it. Please bear
+    with me - it might take some time to fix all the special cases.
+
+    Regular expressions are passed to re.compile(). The `re` module has very good documentation, so I
+    won't even try to beat it ;-)
+    see http://docs.python.org/2/library/re.html
+    A few more notes, though: The PatternMatcher will use the search function, so it will match patterns in
+    the middle of a string. I think this is the natural behaviour because everyone does it (except Python *g*).
+    If you need to set a regex flag, you must do so in the regex using the "(?iLmsux)" syntax. Search for that
+    in the documentation.
+    """
+
+    __slots__ = "_pattern", "_ignore_case"
+
+    def __init__(self, pattern, ignore_case = True):
+        self._pattern, self._ignore_case = self._parse_pattern(pattern, ignore_case)
+
+    def matches(self, text):
+        if isinstance(self._pattern, str):
+            if self._ignore_case:
+                return self._pattern == text.lower()
+            else:
+                return self._pattern == text
+        else:
+            return bool(self._pattern.search(text))
+
+    @classmethod
+    def _parse_pattern(cls, pattern, ignore_case):
+        # prefix is always case-insensitive, so we convert the pattern to lowercase to test prefixes
+        patternL = pattern.lower()
+
+        # process case-sensitivity prefix
+        for prefix, ic_value in [["cs:", False], ["case-sensitive:", False], ["ic:", True], ["ignore-case", True]]:
+            if patternL.startswith(prefix):
+                ignore_case = ic_value
+                pattern  = pattern [len(prefix):]
+                patternL = patternL[len(prefix):]
+                break
+
+        # check type prefix and process pattern
+        if patternL.startswith("exact:"):
+            matcher = pattern[len("exact:"):]
+        elif patternL.startswith("re:"):
+            pattern = pattern[len("re:"):]
+            if ignore_case:
+                flags = re.IGNORECASE
+            else:
+                flags = 0
+            matcher = re.compile(pattern, flags)
+        else:
+            pattern = cls.translate_shell_pattern(pattern)
+            if ignore_case:
+                flags = re.IGNORECASE
+            else:
+                flags = 0
+            matcher = re.compile(pattern, flags)
+
+        return (matcher, ignore_case)
+
+    @staticmethod
+    def translate_shell_pattern(pattern):
+        # We match special parts of the pattern with a regex and replace them. The replacement is
+        # chosen by a function. The function has to keep track of some state (e.g. are we currently
+        # in a character class?), so we use a lambda to pass some state to it.
+
+        initial_status = {
+            "in_braces": 0,
+            "in_brackets": False
+        }
+        def replace(m, status):
+            all = unchanged = m.group(0)
+            ch0 = all[0]
+
+            in_braces, in_brackets = status["in_braces"], status["in_brackets"]
+
+            # escapes remain
+            if ch0 == '\\':
+                if '0' <= all[1] and all[1] <= '9':
+                    # number escapes are special: either group reference or character code
+                    if all[1] == '0' and len(all) >= 3 or len(all) >= 4 or in_brackets:
+                        # character code -> keep
+                        return unchanged
+                    else:
+                        # would be a group reference -> escape it
+                        return "\\" + all
+                elif 'a' <= all[1] and all[1] <= 'z' or 'A' <= all[1] and all[1] <= 'Z':
+                    if all[1] in "afnrtvx" or all[1] == 'b' and in_brackets:
+                        # will be replaced by a special character, e.g. '\n' by newline
+                        return unchanged
+                    else:
+                        # might be a special one (i.e. '\A' for start of string) and we don't have
+                        # to escape it anyway, so we remove the backslash
+                        return all[1:]
+                else:
+                    # regex will treat it properly, i.e. literal
+                    return unchanged
+
+            # ? and * are expanded to appropriate regexes
+            elif all == '?':
+                if not in_brackets:
+                    return "."
+                else:
+                    return unchanged
+            elif all == '*':
+                if not in_brackets:
+                    return ".*"
+                else:
+                    return unchanged
+
+            # [...] remains unchanged, but we must remember that we are in there, so we
+            # don't change any special characters
+            elif all == '[':
+                #NOTE another opening bracket is not an error, I think -> second one is part of the character class
+                status["in_brackets"] = True
+                return unchanged
+            elif all == ']':
+                if not in_brackets:
+                    raise ValueError("too many closing ']'")
+                status["in_brackets"] = False
+                return unchanged
+
+            # {abc,def} becomes (abc|def), but...
+            # - we mustn't change commas outside of {}
+            #   (special case: {[,]} -> don't change)
+            # - we use non-capturing parens: (?:...)
+            elif all == '{':
+                status["in_braces"] += 1
+                return "(?:"
+            elif all == ',':
+                if in_braces > 0 and not in_brackets:
+                    return "|"
+                else:
+                    return unchanged
+            elif all == '}':
+                if in_braces <= 0:
+                    raise ValueError("too many closing '}' in pattern")
+                status["in_braces"] -= 1
+                return ")"
+
+            # escape special chars
+            elif all in [".", "^", "$", "+", "|", "(", ")"]:
+                if not in_brackets:
+                    return "\\" + all
+                else:
+                    return unchanged
+
+            else:
+                # this shouldn't happen
+                raise RuntimeError("Sorry, I don't know how to handle this: %r" % all)
+
+        try:
+            special = "\\\\.|\\\\[0-9]+|[?*{,}.^$+|()]|\\[|\\]"
+            pattern = re.sub(special, lambda m: replace(m, initial_status), pattern)
+
+            if initial_status["in_brackets"]:
+                raise ValueError("missing ']' in pattern: %r" % pattern)
+            elif initial_status["in_braces"] > 0:
+                raise ValueError("missing '}' in pattern: %r" % pattern)
+        except ValueError as e:
+            raise ValueError(e.message + (" in pattern: %r" % pattern))
+
+        # only match complete string
+        pattern = "\\A" + pattern + "\\Z"
+
+        # done :-)
+        return pattern
+
+    def __str__(self):
+        s = "PatternMatcher("
+        if isinstance(self._pattern, str):
+            s += "'" + self._pattern + "'"
+            if self._ignore_case:
+                s += ", ignore-case"
+        else:
+            s += "/" + self._pattern.pattern + "/"
+            if self._ignore_case:
+                s += "i"
+        s += ")"
+        return s
+
 
 #### Classes for test of ShortNameRegistry
 
@@ -744,7 +959,119 @@ class ScaleNotificationFilter(DecoratorNotificationFilter):
 
 ### Some filters
 
+class ShortNameNotificationFilter(WithShortname, NotificationFilter):
+    """Abstract class for notification filters with a short name"""
+    pass
 
+ShortNameRegistry.add_category(NotificationFilter)
+
+
+class AllTagsFilter(ShortNameNotificationFilter):
+    """Matches messages that have all tags"""
+
+    __shortname__ = "all_tags"
+    __slots__ = "_tags"
+
+    def __init__(self, *tags):
+        self._tags = tuple(tags)
+
+    @property
+    def tags(self):
+        return self._tags
+
+    def intersted_in_tags(self):
+        return TagSet(self._tags)
+
+    def prioritize(self, notification):
+        return NotificationPriority( all(map(lambda tag: tag in notification.tags, self._tags)) )
+
+class AnyTagFilter(ShortNameNotificationFilter):
+    """Matches messages that have any of the tags"""
+
+    __shortname__ = "any_tag"
+    __slots__ = "_tags"
+
+    def __init__(self, *tags):
+        self._tags = tuple(tags)
+
+    @property
+    def tags(self):
+        return self._tags
+
+    def intersted_in_tags(self):
+        return TagSet(self._tags) + ["*"]
+
+    def prioritize(self, notification):
+        return NotificationPriority( any(map(lambda tag: tag in notification.tags, self._tags)) )
+
+class HighlightFilter(ShortNameNotificationFilter):
+    """Matches messages that are highlighted for you"""
+
+    __shortname__ = "highlight"
+
+    def prioritize(self, notification):
+        return NotificationPriority(notification.highlight)
+
+class PrivateMessageFilter(ShortNameNotificationFilter):
+    """Matches private messages"""
+
+    __shortname__ = "private"
+
+    def prioritize(self, notification):
+        return NotificationPriority( "notify_private" in notification.tags )
+
+class NickFilter(ShortNameNotificationFilter):
+    """Matches messages from a certain user (supports pattern)"""
+    #TODO support matching by additional information about the user, e.g. host they connect from
+
+    __shortname__ = "nick"
+    __slots__     = "_nick_pattern"
+
+    def __init__(self, nick):
+        self._nick_pattern = PatternMatcher(nick)
+
+    def prioritize(self, notification):
+        #TODO is prefix always the nick?
+
+        # find tag that tells us about the nick
+        #NOTE I think this will always be zero or one, but we support more - just in case ;-)
+        nick = filter(lambda tag: tag.startswith("nick_"), notification.tags)
+        # remove prefix
+        nick = map(lambda tag: tag[5:])
+
+        # does it match the pattern?
+        matches = any(lambda n: self._nick_pattern.matches(n), nick)
+        return NotificationPriority(matches)
+
+class MessageFilter(ShortNameNotificationFilter):
+    """Matches messages that match a pattern"""
+
+    __shortname__ = "text"
+    __slots__     = "_msg_pattern"
+
+    def __init__(self, pattern):
+        self._msg_pattern = PatternMatcher(pattern)
+
+    def prioritize(self, notification):
+        return NotificationPriority( self._msg_pattern.matches(notification.message) )
+
+        # find tag that tells us about the nick
+        #NOTE I think this will always be zero or one, but we support more - just in case ;-)
+        nick = filter(lambda tag: tag.startswith("nick_"), notification.tags)
+        # remove prefix
+        nick = map(lambda tag: tag[5:])
+
+        # does it match the pattern?
+        matches = any(lambda n: self._nick_pattern.matches(n), nick)
+        return NotificationPriority(matches)
+
+class ServerFilter(ShortNameNotificationFilter):
+    """Matches messages on a certain server (supports pattern)"""
+
+    __shortname__ = "server"
+    __slots__     = "_server_pattern"
+
+    #TODO
 
 ### Other stuff
 
@@ -875,6 +1202,79 @@ if have_unittest:
                     self.assertIsInstance(ShortNameRegistry.eval(code_to_eval, *categories), should_be_instance_of)
                 else:
                     self.assertRaises(should_be_instance_of, lambda: ShortNameRegistry.eval(code_to_eval, *categories))
+
+        def testPatternMatcher_translate_shell_pattern(self):
+            def check(pattern, result):
+                self.assertEqual(PatternMatcher.translate_shell_pattern(pattern), result)
+            check(r"a?c*",                     r"\Aa.c.*\Z"                         )
+            check(r"a\?c*",                    r"\Aa\?c.*\Z"                        )
+            check(r"__{a\?c*,b[.,]d}__",       r"\A__(?:a\?c.*|b[.,]d)__\Z"         )
+            check(r"-{a{b,c},d{ef,gh,i}j}-,-", r"\A-(?:a(?:b|c)|d(?:ef|gh|i)j)-,-\Z")
+            check(r"(?M(?:x))",                r"\A\(.M\(.:x\)\)\Z"                 )
+
+            def check_exception(exc, pattern):
+                self.assertRaises(exc, lambda: PatternMatcher.translate_shell_pattern(pattern))
+            check_exception(ValueError, "]")
+            check_exception(ValueError, "[]]")
+            check_exception(ValueError, "}")
+            check_exception(ValueError, "{")
+            check_exception(ValueError, "{{}{}")
+            check_exception(ValueError, "{}}")
+            check_exception(ValueError, "}{}{")
+
+        def testPatternMatcher(self):
+            def check1(pattern, texts, result, ignore_case = True):
+                if isinstance(texts, str):
+                    texts = [texts]
+                if result:
+                    match_wish = "should match"
+                else:
+                    match_wish = "should not match"
+                for text in texts:
+                    matcher = PatternMatcher(pattern, ignore_case)
+                    real_result = matcher.matches(text)
+                    self.assertEqual(real_result, result,
+                        "Pattern '%s' %s '%s', matcher is %s" % (pattern, match_wish, text, matcher))
+
+            def check(pattern, do_match, dont_match, ignore_case = True):
+                check1(pattern, do_match,   True,  ignore_case)
+                check1(pattern, dont_match, False, ignore_case)
+
+            check("exact:abc", ["abc", "Abc", "aBC"], ["aabc", "abcc", "abcd"])
+            check("exact:abc", ["abc", "Abc", "aBC"], ["aabc", "abcc", "abcd"], ignore_case = True)
+            check("exact:abc", ["abc"], ["aabc", "abcc", "abcd", "Abc", "aBC"], ignore_case = False)
+
+            check("exact:a*b*c", ["a*b*c", "A*b*c", "a*B*C"], ["a*a*b*c", "abcc", "ab*"])
+            check("exact:a*b*c", ["a*b*c", "A*b*c", "a*B*C"], ["a*a*b*c", "abcc", "ab*"], ignore_case = True)
+            check("exact:a*b*c", ["a*b*c"], ["a*a*b*c", "abcc", "abcd", "A*b*c", "a*B*C"], ignore_case = False)
+
+            check("abc", ["abc", "Abc", "aBC"], ["aabc", "abcc", "abcd", "\nabc", "abc\n"])
+            check("abc", ["abc", "Abc", "aBC"], ["aabc", "abcc", "abcd", "\nabc", "abc\n"], ignore_case = True)
+            check("abc", ["abc"], ["aabc", "abcc", "abcd", "Abc", "aBC", "\nabc", "abc\n"], ignore_case = False)
+
+            check("abc*", ["abc", "Abc", "aBC", "abcc", "abcd"], ["aabc", "*abc", "*abc*"])
+            check("abc*", ["abc", "Abc", "aBC", "abcc", "abcd"], ["aabc", "*abc", "*abc*"], ignore_case = True)
+            check("abc*", ["abc", "abcc", "abcd"], ["aabc", "Abc", "aBC", "*abc", "*abc*"], ignore_case = False)
+
+            check("re:abc", ["abc", "Abc", "aBC", "abcc", "abcd", "*abc"], ["aa bc", "*ab*c"])
+            check("re:abc", ["abc", "Abc", "aBC", "abcc", "abcd", "*abc"], ["aa bc", "*ab*c"], ignore_case = True)
+            check("re:abc", ["abc", "aabc", "abcc", "abcd"], ["Abc", "aBC", "aa bc", "*ab*c"], ignore_case = False)
+
+            check("re:^ab*c$", ["ac", "abc", "abBc", "ac\n"], ["aac", "bac", "acb", "\nac", "ac\nx"])
+            check("re:^ab*c$", ["ac", "abc", "abBc", "ac\n"], ["aac", "bac", "acb", "\nac", "ac\nx"], ignore_case = True)
+            check("re:^ab*c$", ["ac", "abc", "ac\n"], ["abBc", "aac", "bac", "acb", "\nac", "ac\nx"], ignore_case = False)
+
+            check("re:\\Aab*c\\Z", ["ac", "abc", "abBc", "AbBbC"], ["aac", "bac", "acb", "\nac", "ac\n"])
+            check("re:\\Aab*c\\Z", ["ac", "abc", "abBc", "AbBbC"], ["aac", "bac", "acb", "\nac", "ac\n"], ignore_case = True)
+            check("re:\\Aab*c\\Z", ["ac", "abc"], ["abBc", "AbBbC", "aac", "bac", "acb", "\nac", "ac\n"], ignore_case = False)
+
+            check("(?M(?:x))",     ["(?M(?:x))",  "(+M(-:x))" ], ["x", "xy", " (?M(?:x))", "(?M(?:x)) "])
+            check("(?m)(?:^x)",    ["(?m)(?:^x)", "(-m)(+:^x)"], ["x", "xy", " (?M(?:x))", "(?M(?:x)) "])
+            check("re:(?m)(?:^x)", ["xy", "abc\nx"], ["(?m)(?:^x)"])
+            check("re:(?:^x)",     ["xy"],           ["abc\nx"]    )
+
+
+### decide which main program to run
 
 if __name__ == "__main__":
     if in_weechat:
