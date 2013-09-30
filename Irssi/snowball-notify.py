@@ -76,6 +76,7 @@ except:
 # -> print to WeeChat main buffer
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 if in_weechat:
     # log to weechat root buffer and don't propagate to default handler
@@ -294,43 +295,90 @@ class NotificationFilter(object):
 
 ### WeeChat-specific subclasses
 
-weechat_notification_source_instances = {}
+class ObjectRegistry(object):
+    _instances = {}
 
-def on_notification(id, *args):
-    global weechat_notification_source_instances
-    self = weechat_notification_source_instances[int(id)]
-    return self.on_notification(Notification(*args))
+    @classmethod
+    def register(cls, object):
+        id = -1
+        while id < 0 or id in cls._instances:
+            id = random.randint(1, 1000000)
+        cls._instances[id] = object
+        return id
+
+    @classmethod
+    def unregister(cls, id):
+        del cls._instances[int(id)]
+
+    @classmethod
+    def get(cls, id):
+        return cls._instances[int(id)]
+
+def _on_notification(id, *args):
+    self = ObjectRegistry.get(id)
+    return self.on_notification(args)
 
 class WeeChatNotificationSource(NotificationSource):
+    __slots__ = "_last_messages", "_last_messages_next", "_hooks", "_id"
+
     def __init__(self, sink):
         global weechat_notification_source_instances
         super(WeeChatNotificationSource, self).__init__(sink)
-        self.id = -1
-        while self.id < 0 or self.id in weechat_notification_source_instances:
-            self.id = random.randint(0, 10000)
-        weechat_notification_source_instances[self.id] = self
-        weechat.prnt("", "id: %d" % self.id)
+        self._id = ObjectRegistry.register(self)
+        weechat.prnt("", "id: %d" % self._id)
 
-        self._hook = None
+        self._hooks = {}
+
+        # store 5 last messages, so we don't send them multiple times
+        self._last_messages = [None] * 5
+        self._last_messages_next = 0
 
     def enable(self):
         tags = self.sink.intersted_in_tags()
-        tags.remove("*")
+        if "*" in tags:
+            tags.remove("*")
         if len(tags) == 0:
             logger.warning("Enabling hook for an empty set of tags. You won't get any notifications.")
-        tags_str = ",".join(tags)
-        self._hook = weechat.hook_print("", tags_str,   "", 1, "on_notification", str(self.id))
+
+        #NOTE hook_print supports more than one tag for the tags argument, but this is AND, so we cannot use it
+        for tag in tags:
+            self.enable_tag(tag)
 
     def disable(self):
-        if self._hook:
-            weechat.unhook(self._hook)
-            self._hook = None
-            return True
-        else:
-            return False
+        for tag in self._hooks.keys():
+            self.disable_tag(tag)
+
+    def update(self):
+        active_tags = set(self._hooks.keys())
+        wanted_tags = self.sink.intersted_in_tags()
+        for tag in wanted_tags - active_tags:
+            self.enable_tag(tag)
+        for tag in active_tags - wanted_tags:
+            self.disable_tag()
+
+    def enable_tag(self, tag):
+        if tag not in self._hooks:
+            self._hooks[tag] = weechat.hook_print("", tag, "", 1, "_on_notification", str(self._id))
+
+    def disable_tag(self, tag):
+        if tag in self._hooks:
+            weechat.unhook(self._hooks[tag])
+            del self._hooks[tag]
 
     def on_notification(self, notification):
-        self.sink.notify(notification)
+        #NOTE If a message matches more than one tag, we receive it more than once. Therefore, we filter duplicate messages.
+        if any(map(lambda x: x == notification, self._last_messages)):
+            # we already got that one
+            logger.info("got duplicate notification")
+            return weechat.WEECHAT_RC_OK
+
+        # add it to the queue
+        i = self._last_messages_next
+        self._last_messages[i] = notification
+        self._last_messages_next = (i+1) % len(self._last_messages)
+
+        # send notification
+        self.sink.notify(Notification(*notification))
         return weechat.WEECHAT_RC_OK
 
 
@@ -447,6 +495,7 @@ class OperatorNotificationFilter(NotificationFilter):
             logger.error("Unknown operator '%s'", self.operator)
             return TagSet("*")
 
+
 ### helper filters
 
 class DecoratorNotificationFilter(NotificationFilter):
@@ -477,9 +526,50 @@ class ScaleNotificationFilter(DecoratorNotificationFilter):
         return super(ScaleNotificationFilter, self).prioritize(notification) * self._factor
 
 
+### some filters
+
+class RegisteredNotificationFilter(NotificationFilter):
+    """Abstract class. This filter has a short name that the user can use when building filters"""
+
+    _registry = {}
+
+    @classmethod
+    def register(cls, name, filter):
+        if name in cls._registry:
+            raise ValueError("The name '%s' is already used for another NotificationFilter.")
+        cls._registry[name] = filter
+        # return filter class, so this can be used as a class decorator
+        return filter
+
+    @classmethod
+    def has(cls, name):
+        return name in cls._registry
+
+    @classmethod
+    def get(cls, name):
+        return cls._registry[name]
+
+    @classmethod
+    def make_local_scope(cls):
+        # a scope is just a dict, so we simply copy our registry
+        return cls._registry.copy()
+
+    @classmethod
+    def eval_filter(cls, expr):
+        return eval(expr, globals(), cls.make_local_scope())
+
+def register(name):
+    return lambda cls: RegisteredNotificationFilter.register(name, cls)
+
+@register("blub")
+class BlubNotificationFilter(RegisteredNotificationFilter):
+    pass
 
 
+del register
 
+
+### other stuff
 
 class RemoteNotifySink(NotificationSink):
     def __init__(self, inner):
@@ -492,6 +582,9 @@ def run_debug(self, argv):
 class DebugNotificationSink(NotificationSink):
     def notify(self, notification):
         weechat.prnt("", repr(notification))
+
+    def intersted_in_tags(self):
+        return TagSet("notify_message", "notify_private", "notify_highlight", "nick_snowball")
 
 def run_weechat():
     if weechat.register(SCRIPT_NAME, SCRIPT_AUTHOR, SCRIPT_VERSION, SCRIPT_LICENSE, SCRIPT_DESC, "", ""):
@@ -574,6 +667,14 @@ if have_unittest:
 
             # not testing __sub__ because it behaves like set.__sub__
             # Yeah, I wouldn't have to test union() for the same reason...
+
+        def testRegisteredNotificationFilter(self):
+            self.assertTrue(RegisteredNotificationFilter.has("blub"))
+            self.assertTrue(not RegisteredNotificationFilter.has("unobtainium"))
+
+            self.assertIs(RegisteredNotificationFilter.get("blub"), BlubNotificationFilter)
+
+            self.assertIsInstance(RegisteredNotificationFilter.eval_filter("blub()"), BlubNotificationFilter)
 
 if __name__ == "__main__":
     if in_weechat:
