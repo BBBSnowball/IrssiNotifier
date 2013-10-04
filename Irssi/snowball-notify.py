@@ -58,7 +58,7 @@ SCRIPT_DESC    = "Send notifications"
 DEBUG = True
 
 
-import sys, random, time, logging, inspect, re
+import sys, random, time, logging, inspect, re, traceback, subprocess, os
 
 try:
     import weechat
@@ -101,13 +101,32 @@ class Notification(object):
 
     def __init__(self, buffer, date, tags, displayed, highlight, prefix, message):
         #TODO parse data
-        self.buffer    = buffer
-        self.date      = time.localtime(int(date))
-        self.tags      = set(tags.split(","))
-        self.displayed = bool(int(displayed))
-        self.highlight = bool(int(highlight))
-        self.prefix    = prefix
-        self.message   = message
+        self.buffer_ptr = buffer
+        self.date       = time.localtime(int(date))
+        self.tags       = set(tags.split(","))
+        self.displayed  = bool(int(displayed))
+        self.highlight  = bool(int(highlight))
+        self.prefix     = prefix
+        self.message    = message
+
+    @property
+    def is_private(self):
+        """is it a private message (i.e. not on a channel, but directly to a user) ?"""
+        return "notify_private" in self.tags
+
+    @property
+    def short_buffer_name(self):
+        return self.buffer_ptr and weechat.buffer_get_string(self.buffer_ptr, "short_name")
+
+    @property
+    def target(self):
+        """to whom has the message been sent?
+
+        This is either a channel name or "me" for a private message."""
+        if self.is_private:
+            return "me"
+        else:
+            return self.short_buffer_name
 
     def __repr__(self):
         return "Notification(" + repr(self.__dict__) + ")"
@@ -756,7 +775,6 @@ class WeeChatNotificationSource(NotificationSource):
         global weechat_notification_source_instances
         super(WeeChatNotificationSource, self).__init__(sink)
         self._id = ObjectRegistry.register(self)
-        weechat.prnt("", "id: %d" % self._id)
 
         self._hooks = {}
 
@@ -769,9 +787,11 @@ class WeeChatNotificationSource(NotificationSource):
         if "*" in tags:
             tags.remove("*")
         if len(tags) == 0:
-            logger.warning("Enabling hook for an empty set of tags. You won't get any notifications.")
+            logger.warning("Enabling hook for an empty set of tags. You won't get any "
+                + "notifications.")
 
-        #NOTE hook_print supports more than one tag for the tags argument, but this is AND, so we cannot use it
+        #NOTE hook_print supports more than one tag for the tags argument, but this is AND, so
+        #     we cannot use it
         for tag in tags:
             self.enable_tag(tag)
 
@@ -797,7 +817,8 @@ class WeeChatNotificationSource(NotificationSource):
             del self._hooks[tag]
 
     def on_notification(self, notification):
-        #NOTE If a message matches more than one tag, we receive it more than once. Therefore, we filter duplicate messages.
+        #NOTE If a message matches more than one tag, we receive it more than once. Therefore, we
+        #     filter duplicate messages.
         if any(map(lambda x: x == notification, self._last_messages)):
             # we already got that one
             logger.info("got duplicate notification")
@@ -820,19 +841,20 @@ class MultiNotificationSink(NotificationSink):
 
     __slots__ = "_sinks", "default_target_status", "default_status"
     def __init__(self, *sinks):
-        if isinstance(sinks[0], [int, DeliveryStatus]):
+        if isinstance(sinks[0], (int, DeliveryStatus)):
             self.default_target_status = sinks[0]
             del sinks[0]
         else:
             self.default_target_status = DeliveryStatus.unknown
 
-        if isinstance(sinks[0], [int, DeliveryStatus]):
+        if isinstance(sinks[0], (int, DeliveryStatus)):
             self.default_status = sinks[0]
             del sinks[0]
         else:
             self.default_status = DeliveryStatus.not_presented
 
-        self._sinks = list(sinks)
+        self._sinks = [ ]
+        self.add_sinks(sinks)
 
     def __new__(cls, *sinks):
         # create a new MultiNotificationSink or use the first one
@@ -840,13 +862,18 @@ class MultiNotificationSink(NotificationSink):
         if len(sinks) >= 1 and isinstance(sinks[0], MultiNotificationSink):
             sink = sinks[0]
             del sinks[0]
+
+            # add sinks
+            sink.add_sinks(sinks)
         else:
-            sink = super(MultiNotificationSink, cls).__new__(cls)
-        for sink2 in sinks:
-            sink += sink2
+            sink = super(MultiNotificationSink, cls).__new__(cls, sinks)
+
+        return sink
 
     def add_sink(self, sink, target_status = None):
         """Add a sink at the end"""
+        if target_status is None:
+            target_status = self.default_target_status
         self._sinks.append([sink, target_status])
 
     def del_sink(self, sink):
@@ -858,6 +885,10 @@ class MultiNotificationSink(NotificationSink):
         else:
             return False
 
+    def add_sinks(self, sinks):
+        for sink2 in sinks:
+            self.add_sink(sink2)
+
     def __iadd__(self, sink):
         """Add a sink at the end"""
         self.add_sink(sink)
@@ -866,9 +897,13 @@ class MultiNotificationSink(NotificationSink):
         """Remove a sink"""
         self.del_sink(sink)
 
+    @property
+    def children(self):
+        return map(lambda x: x[0], self._sinks)
+
     def intersted_in_tags(self):
         tags = TagSet()
-        for child in self._sinks:
+        for child in self.children:
             tags.update(child.intersted_in_tags())
         return tags
 
@@ -1073,6 +1108,251 @@ class ServerFilter(ShortNameNotificationFilter):
 
     #TODO
 
+
+### Notification sinks
+
+class ShortNameNotificationSink(WithShortname, NotificationSink):
+    """Abstract class for notification sinks with a short name"""
+    pass
+
+ShortNameRegistry.add_category(NotificationSink)
+
+
+# LibnotifySink and NotifySendSink are based on
+# pyrnotify.py by Krister Svanlund <krister.svanlund@gmail.com>
+# http://www.weechat.org/scripts/source/pyrnotify.py.html/
+
+class LibnotifySink(ShortNameNotificationSink):
+    __shortname__ = "libnotify"
+    __slots__     = ()
+
+    def __new__(cls, *args, **kwargs):
+        """LibnotifySink is abstract, so this method returns an instance of
+        either PyNotifySink (preferred) or NotifySendSink"""
+        if cls != LibnotifySink:
+            # constructor has been called for a subclass
+            # -> we won't mess with it
+            return super(LibnotifySink, cls).__new__(cls, *args, **kwargs)
+
+        if PyNotifySink.available():
+            logger.info("Using PyNotifySink to provide LibnotifySink")
+            return PyNotifySink(*args, **kwargs)
+        elif NotifySendSink.available():
+            logger.info("Using NotifySendSink to provide LibnotifySink")
+            return NotifySendSink(*args, **kwargs)
+        else:
+            raise RuntimeError("Please install either the pynotify library or the "
+                + "notify-send binary. On Debian, you can do that with one of these commands:\n"
+                + "  sudo apt-get install python-gobject\n"
+                + "  sudo apt-get install python-notify2    # or python3-notify2\n"
+                + "  sudo apt-get install libnotify-bin")
+
+    def _get_icon(self, notification):
+        if notification.is_private and weechat.config_get_plugin('pm-icon'):
+            return "emblem-favorite"        #TODO: w.config_get_plugin('pm-icon')
+        else:
+            return "utilities-terminal"     #TODO: w.config_get_plugin('icon')
+        # This one is also a nice option: "/usr/share/pixmaps/weechat.xpm"
+        # It is used by notify.py
+
+    def _get_urgency(self, notification):
+        return "normal"
+
+    def _get_title(self, notification):
+        sender  = notification.prefix
+        title   = "%s to %s" % (sender, notification.target)
+        return title
+
+    def _get_timeout(self, notification):
+        # timeout is in milliseconds. It must be an int or None.
+        # None: default
+        # -1:   default
+        #  0:   forever
+        # >0:   timeout in milliseconds
+        return None
+
+    def do_notify(self, urgency, category, icon, title, body, timeout):
+        raise NotImplementedError()
+
+    def notify(self, notification):
+        # filtering shouldn't be in here
+        if not notification.is_private and not notification.highlight:
+            return
+
+        urgency  = self._get_urgency(notification)
+        category = "IRC"
+        icon     = self._get_icon(notification)
+        title    = self._get_title(notification)
+        body     = notification.message
+        timeout  = self._get_timeout(notification)
+
+        self.do_notify(urgency, category, icon, title, body, timeout)
+
+class NotifySendSink(LibnotifySink):
+    __shortname__ = "notify_send"
+    __slots__     = ()
+
+    @staticmethod
+    def available():
+        try:
+            with open(os.devnull, 'w') as fnull:
+                return 0 == subprocess.call(["which", "notify-send"],
+                    # output goes to /dev/null (hide it)
+                    stdout = fnull, stderr = fnull)
+        except OSError:
+            # we cannot even call 'which'?
+            return False
+
+    def __init__(self):
+        if not NotifySendSink.available():
+            raise RuntimeError("Please install either the "
+                + "notify-send binary. On Debian, you can do that like this:\n"
+                + "  sudo apt-get install libnotify-bin")
+
+    @staticmethod
+    def _escape(s):
+        return re.sub(r'([\\"\'])', r'\\\1', s)
+    def do_notify(self, urgency, category, icon, title, body, timeout):
+        args = ["notify-send"] + (["-t", int(timeout)] if timeout else [])       \
+                + ["-u", urgency, "-c", self._escape(category), "-i", icon, \
+                   self._escape(title), self._escape(body)]
+        try:
+            subprocess.call(args)
+        except ValueError:
+            logger.exception("Error while calling notify-send: %r", args)
+        except OSError:
+            logger.exception("Error while calling notify-send: %r", args)
+
+# Bindings from gi.repository should be newer than pynotify module, so we try them first
+# see http://stackoverflow.com/q/14360006
+try:
+    from gi.repository import Notify
+    have_pynotify = True
+
+    # rename it, so we can use the same name no matter which module we import)
+    pynotify = Notify
+    pynotify_type = "gi"
+    del Notify
+except ImportError:
+    # hm, didn't work -> try the other one
+    try:
+        import pynotify
+        have_pynotify = True
+        pynotify_type = "pynotify"
+    except:
+        have_pynotify = False
+
+
+# documentation is here: https://developer-next.gnome.org/libnotify/0.7/
+# Python bindings are quite straight-forward. I couldn't find any reference doc,
+# but there are some examples: https://wiki.archlinux.org/index.php/Libnotify#Python
+class PyNotifySink(LibnotifySink):
+    __shortname__ = "pynotify"
+    __slots__     = ()
+
+    @staticmethod
+    def available():
+        return have_pynotify
+
+    def __init__(self):
+        if not NotifySendSink.available():
+            raise RuntimeError("Please install either the "
+                + "notify-send binary. On Debian, you can run one of these commands:\n"
+                + "  sudo apt-get install python-gobject\n"
+                + "  sudo apt-get install python-notify2    # or python3-notify2")
+
+        # we use the same name as notify.py
+        if not pynotify.is_initted():
+            pynotify.init("wee-notifier")
+
+        #NOTE We may want to use pynotify.get_server_caps() and pynotify.get_server_info()
+        #     to learn something about the notification server. On my system, they return this:
+        # caps: ['actions', 'body', 'body-markup', 'icon-static', 'x-canonical-private-icon-only']
+        # info: {'version': '0.2.2', 'vendor': 'Xfce', 'name': 'Xfce Notify Daemon',
+        #        'spec-version': '0.9'}
+        #       via pynotify
+        # info: (True, 'Xfce Notify Daemon', 'Xfce', '0.2.2', '0.9')
+        #       via gi.repository.Notify
+        # I'm running Ubuntu 12.04 with a Unity desktop (not xfce).
+
+    def translate_urgency(self, urgency_name):
+        urgency_name = urgency_name.upper()
+
+        if False:
+            # We cannot pynotify.Urgency because it causes this error:
+            #   Warning: cannot register existing type `Urgency'
+            #   SystemError: error return without exception set
+            # It breaks when WeeChat reloads the script (this means it works, if
+            # you don't reload the script). I think gi forgets the Python part of
+            # the state, but it keeps the C part. Therefore, Python thinks it should
+            # register the enum, but the C code complains because it did register the
+            # same type earlier.
+            # It works fine with pynotify; probably because we don't access the Urgency
+            # type in any direct way.
+
+            # pynotify has pynotify.URGENCY_LOW, but gi.repository.Notify has Urgency.LOW
+            #NOTE both have pynotify.Urgency
+            print urgency_name
+            print pynotify.Urgency
+            value = getattr(getattr(pynotify, "Urgency", None), urgency_name, None)
+            if value is not None:
+                print value
+                return value
+
+            # try the old way
+            value = getattr(pynotify, "URGENCY_" + urgency_name, None)
+            if value is not None:
+                print value
+                return value
+        else:
+            # simple solution: hardcode the values
+            urgencies_by_name = { "LOW": 0, "NORMAL": 1, "CRITICAL": 2 }
+            if urgency_name in urgencies_by_name:
+                return urgencies_by_name[urgency_name]
+            else:
+                return 
+
+        # nope, we can't find it
+        raise ValueError("Unknown urgency: %s" % urgency_name)
+
+    def do_notify(self, urgency, category, icon, title, body, timeout):
+        if pynotify_type == "gi":
+            nn = pynotify.Notification(summary = title)
+            nn.update(title, body, icon)
+        else:
+            nn = pynotify.Notification(title, body, icon)
+        nn.set_category(category)
+        nn.set_urgency(self.translate_urgency(urgency))
+        if timeout:
+            nn.set_timeout(int(timeout))
+        nn.show()
+        #NOTE We can do some things that we couldn't do with notify-send:
+        # - use add_action to add a button to the notification
+        #   def blub(notification, action_name, user_data):
+        #     ...
+        #   n.add_action("name", "label", blub, user_data)
+        # - close the notification, if the user reads it in WeeChat (and probably
+        #   keep it open for a longer time or even NOTIFY_EXPIRES_NEVER)
+        # - wait for the "closed" signal and find out why the notification was closed
+        #   def closed(notification):
+        #     ...
+        #   n.connect("closed", close)
+        #   NOTE get_closed_reason is not available in pynotify (at least in my version)
+        #        However, we can use get_property("closed-reason") to get it anyway.
+        #   The meaning of that value isn't explained in libnotify. I found it in the
+        #   source code of notify-daemon:
+        #   https://launchpad.net/ubuntu/+source/notification-daemon/0.7.3-1
+        #   notification-daemon_0.7.3.orig.tar.xz: src/nd-notification.h
+        #   typedef enum
+        #   {
+        #           ND_NOTIFICATION_CLOSED_EXPIRED = 1,
+        #           ND_NOTIFICATION_CLOSED_USER = 2,
+        #           ND_NOTIFICATION_CLOSED_API = 3,
+        #           ND_NOTIFICATION_CLOSED_RESERVED = 4
+        #   } NdNotificationClosedReason;
+        #   In addition, the default value (not closed, yet) is -1.
+
+
 ### Other stuff
 
 class RemoteNotifySink(NotificationSink):
@@ -1094,7 +1374,7 @@ def run_weechat():
     if weechat.register(SCRIPT_NAME, SCRIPT_AUTHOR, SCRIPT_VERSION, SCRIPT_LICENSE, SCRIPT_DESC, "", ""):
         #TODO add settings
         #TODO init
-        w = WeeChatNotificationSource(DebugNotificationSink())
+        w = WeeChatNotificationSource(DebugNotificationSink() + LibnotifySink())
         w.enable()
 
 if have_unittest:
